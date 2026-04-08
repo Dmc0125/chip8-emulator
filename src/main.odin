@@ -25,22 +25,38 @@ STACK_DEPTH :: 12
 REGISTERS_COUNT :: 16
 
 Emulator :: struct {
-	pc:               u16,
-	stack_idx:        int,
-	stack:            [STACK_DEPTH]u16,
-	memory:           [4 * mem.Kilobyte]byte,
-	registers:        [REGISTERS_COUNT]byte,
-	address_register: u16,
-	display:          [SCREEN_COLUMNS * SCREEN_ROWS]byte,
-	keys:             [16]bool,
+	pc:                  u16,
+	stack_idx:           int,
+	stack:               [STACK_DEPTH]u16,
+	memory:              [4 * mem.Kilobyte]byte,
+	registers:           [REGISTERS_COUNT]byte,
+	address_register:    u16,
+	display:             [SCREEN_COLUMNS * SCREEN_ROWS]byte,
+	keys:                [16]bool,
+	waiting_for_release: bool,
+	last_key_pressed:    u8,
+	delay_timer:         u8,
+	sound_timer:         u8,
 }
 
 emulator_init :: proc(emulator: ^Emulator, program_data: []byte) {
 	emulator.pc = MEM_START
+	emulator.last_key_pressed = 0xFF
 	copy(emulator.memory[MEM_START:], program_data)
 }
 
-emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
+
+emulator_frame_start :: proc(emulator: ^Emulator) {
+	emulator.last_key_pressed = 0xFF
+	if emulator.sound_timer > 0 {
+		emulator.sound_timer -= 1
+	}
+	if emulator.delay_timer > 0 {
+		emulator.delay_timer -= 1
+	}
+}
+
+emulator_process_instructions :: proc(emulator: ^Emulator) {
 	reg_and_immediate :: proc(ix: u16) -> (reg, imm: u8) {
 		reg = u8((ix >> 8) & 0x0F)
 		imm = u8(ix & 0xFF)
@@ -63,7 +79,7 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 		case 0x0:
 			switch ix {
 			case 0x00E0:
-				// clear	
+				// clear
 				for _, i in emulator.display {
 					emulator.display[i] = 0
 				}
@@ -73,6 +89,9 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 
 				emulator.stack_idx -= 1
 				emulator.pc = emulator.stack[emulator.stack_idx]
+			case:
+				log.errorf("instruction unimplemented: ", ix)
+				assert(false)
 			}
 		case 0x1:
 			emulator.pc = ix & 0x0FFF
@@ -153,6 +172,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 				vf := (registers[reg1] & 0x80) >> 7
 				registers[reg1] <<= 1
 				registers[0xF] = vf
+			case:
+				log.errorf("instruction unimplemented: ", ix)
+				assert(false)
+
 			}
 		case 0x9:
 			if reg1, reg2 := regs(ix); emulator.registers[reg1] != emulator.registers[reg2] {
@@ -212,6 +235,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 				if !pressed {
 					emulator.pc += 2
 				}
+			case:
+				log.errorf("instruction unimplemented: ", ix)
+				assert(false)
+
 			}
 		case 0xF:
 			reg, _ := regs(ix)
@@ -220,20 +247,27 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 			registers := &emulator.registers
 
 			switch flag {
+			case 0x07:
+				registers[reg] = emulator.delay_timer
 			case 0x0A:
-				any_pressed := false
-				key_code: u8
-				for key, i in emulator.keys do if key {
-					any_pressed = true
-					key_code = u8(i)
-					break
-				}
-				if !any_pressed {
-					blocked = true
-					return
+				if emulator.waiting_for_release {
+					key := registers[reg]
+					if !emulator.keys[key] {
+						emulator.waiting_for_release = false
+					} else {
+						return
+					}
 				} else {
-					registers[reg] = key_code
+					if emulator.last_key_pressed != 0xFF {
+						registers[reg] = emulator.last_key_pressed
+						emulator.waiting_for_release = true
+					}
+					return
 				}
+			case 0x15:
+				emulator.delay_timer = registers[reg]
+			case 0x18:
+				emulator.sound_timer = registers[reg]
 			case 0x1E:
 				emulator.address_register += u16(registers[reg])
 			case 0x33:
@@ -257,6 +291,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 				for r in 0 ..= reg {
 					registers[r] = emulator.memory[mem_start + u16(r)]
 				}
+			case:
+				log.errorf("instruction unimplemented: ", ix)
+				assert(false)
+
 			}
 		case:
 			log.errorf("instruction unimplemented: ", ix)
@@ -268,7 +306,6 @@ emulator_process_instructions :: proc(emulator: ^Emulator) -> (blocked: bool) {
 
 	return
 }
-
 
 main :: proc() {
 	context.logger = log.create_file_logger(
@@ -324,6 +361,55 @@ main :: proc() {
 		return
 	}
 
+	SAMPLE_RATE :: 44100 // hz
+	TONE_HZ :: 880
+	AMPLITUDE :: 6000
+
+	audio_device := SDL.OpenAudioDevice(
+		nil,
+		false,
+		&SDL.AudioSpec{format = SDL.AUDIO_S16, freq = SAMPLE_RATE, channels = 1, samples = 512},
+		nil,
+		{},
+	)
+	if audio_device == 0 {
+		log.errorf("unable to open audio device: %s", SDL.GetErrorString())
+		return
+	}
+	SDL.PauseAudioDevice(audio_device, false)
+
+	audio_update :: proc(device: SDL.AudioDeviceID, timer: u8, allocator: runtime.Allocator) {
+		queued := SDL.GetQueuedAudioSize(device)
+
+		if timer > 0 {
+			// we want 2 frames worth of sound in queue
+			// we are using AUDIO_S16 format so one sample is 2 bytes
+			target_bytes := u32(SAMPLE_RATE / 30 * size_of(i16))
+			if queued < target_bytes {
+				samples_needed := (target_bytes - queued) / size_of(i16)
+				buf := make([]i16, samples_needed, allocator = allocator)
+				@(static) phase: f64
+
+				for _, i in buf {
+					buf[i] = i16(math.sin(phase * 2 * math.PI) * AMPLITUDE)
+					phase += f64(TONE_HZ) / SAMPLE_RATE
+					if phase > 1 {
+						phase -= 1
+					}
+				}
+
+				if SDL.QueueAudio(device, raw_data(buf), samples_needed * size_of(i16)) != 0 {
+					log.errorf("unable to queue audio: %s", SDL.GetErrorString())
+					assert(false)
+				}
+			}
+		} else {
+			if queued > 0 {
+				SDL.ClearQueuedAudio(device)
+			}
+		}
+	}
+
 	// interpret
 
 	TARGET_FPS: f64 : 60
@@ -334,6 +420,10 @@ main :: proc() {
 
 	for {
 		frame_start := time.tick_now()
+		free_all(context.temp_allocator)
+
+		audio_update(audio_device, emulator.sound_timer, context.temp_allocator)
+		emulator_frame_start(&emulator)
 
 		{
 			get_key :: proc(scancode: SDL.Scancode) -> (key: u8) {
@@ -383,6 +473,7 @@ main :: proc() {
 				case .KEYDOWN:
 					if key := get_key(event.key.keysym.scancode); key != 0xFF {
 						emulator.keys[key] = true
+						emulator.last_key_pressed = key
 					}
 				case .KEYUP:
 					if key := get_key(event.key.keysym.scancode); key != 0xFF {
@@ -392,22 +483,20 @@ main :: proc() {
 			}
 		}
 
-		drawing_blocked := emulator_process_instructions(&emulator)
+		emulator_process_instructions(&emulator)
 
 		// draw
 
-		if !drawing_blocked {
-			SDL.SetRenderDrawColor(renderer, 255, 255, 255, 255)
-			SDL.RenderClear(renderer)
+		SDL.SetRenderDrawColor(renderer, 255, 255, 255, 255)
+		SDL.RenderClear(renderer)
 
-			for pixel, pixel_idx in emulator.display do if pixel == 1 {
-				px := u8(pixel_idx % 64)
-				py := u8(pixel_idx / 64)
-				draw_pixel(renderer, px, py)
-			}
-
-			SDL.RenderPresent(renderer)
+		for pixel, pixel_idx in emulator.display do if pixel == 1 {
+			px := u8(pixel_idx % 64)
+			py := u8(pixel_idx / 64)
+			draw_pixel(renderer, px, py)
 		}
+
+		SDL.RenderPresent(renderer)
 
 		frame_duration := time.tick_since(frame_start)
 		remaining := TARGET_FRAME_TIME - time.duration_seconds(frame_duration)
