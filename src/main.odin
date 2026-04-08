@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:log"
 import "core:math"
+import "core:math/rand"
 import "core:mem"
 import "core:os"
 import "core:time"
@@ -18,7 +19,7 @@ draw_pixel :: proc(renderer: ^SDL.Renderer, x, y: u8) {
 SCREEN_COLUMNS :: 64
 SCREEN_ROWS :: 32
 
-INSTRUCTIONS_PER_FRAME :: 700
+INSTRUCTIONS_PER_FRAME :: 10
 MEM_START :: 0x200
 
 STACK_DEPTH :: 12
@@ -43,8 +44,30 @@ emulator_init :: proc(emulator: ^Emulator, program_data: []byte) {
 	emulator.pc = MEM_START
 	emulator.last_key_pressed = 0xFF
 	copy(emulator.memory[MEM_START:], program_data)
-}
 
+	font := [?][]byte {
+		[]byte{0xF0, 0x90, 0x90, 0x90, 0xF0}, // 0
+		[]byte{0x20, 0x60, 0x20, 0x20, 0x70}, // 1
+		[]byte{0xF0, 0x10, 0xF0, 0x80, 0xF0}, // 2
+		[]byte{0xF0, 0x10, 0xF0, 0x10, 0xF0}, // 3
+		[]byte{0x90, 0x90, 0xF0, 0x10, 0x10}, // 4
+		[]byte{0xF0, 0x80, 0xF0, 0x10, 0xF0}, // 5
+		[]byte{0xF0, 0x80, 0xF0, 0x90, 0xF0}, // 6
+		[]byte{0xF0, 0x10, 0x20, 0x40, 0x40}, // 7
+		[]byte{0xF0, 0x90, 0xF0, 0x90, 0xF0}, // 8
+		[]byte{0xF0, 0x90, 0xF0, 0x10, 0xF0}, // 9
+		[]byte{0xF0, 0x90, 0xF0, 0x90, 0x90}, // A
+		[]byte{0xE0, 0x90, 0xE0, 0x90, 0xE0}, // B
+		[]byte{0xF0, 0x80, 0x80, 0x80, 0xF0}, // C
+		[]byte{0xE0, 0x90, 0x90, 0x90, 0xE0}, // D
+		[]byte{0xF0, 0x80, 0xF0, 0x80, 0xF0}, // E
+		[]byte{0xF0, 0x80, 0xF0, 0x80, 0x80}, // F
+	}
+	for c, i in font {
+		start := i * 5
+		copy(emulator.memory[start:start + 5], c)
+	}
+}
 
 emulator_frame_start :: proc(emulator: ^Emulator) {
 	emulator.last_key_pressed = 0xFF
@@ -57,16 +80,21 @@ emulator_frame_start :: proc(emulator: ^Emulator) {
 }
 
 emulator_process_instructions :: proc(emulator: ^Emulator) {
-	reg_and_immediate :: proc(ix: u16) -> (reg, imm: u8) {
+	reg_imm :: proc(ix: u16) -> (reg, imm: u8) {
 		reg = u8((ix >> 8) & 0x0F)
 		imm = u8(ix & 0xFF)
 		return
 	}
 
-	regs :: proc(ix: u16) -> (reg1, reg2: u8) {
+	reg_reg :: proc(ix: u16) -> (reg1, reg2: u8) {
 		reg1 = u8((ix >> 8) & 0x0F)
 		reg2 = u8(ix) >> 4
 		return
+	}
+
+	ix_unimplemented :: proc(ix: u16) {
+		log.errorf("instruction unimplemented: %04x", ix)
+		assert(false)
 	}
 
 	instructions: for _ in 0 ..< INSTRUCTIONS_PER_FRAME {
@@ -90,8 +118,7 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				emulator.stack_idx -= 1
 				emulator.pc = emulator.stack[emulator.stack_idx]
 			case:
-				log.errorf("instruction unimplemented: ", ix)
-				assert(false)
+				ix_unimplemented(ix)
 			}
 		case 0x1:
 			emulator.pc = ix & 0x0FFF
@@ -105,31 +132,27 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 			emulator.pc = ix & 0x0FFF
 			continue
 		case 0x3:
-			reg, imm := reg_and_immediate(ix)
+			reg, imm := reg_imm(ix)
 			if emulator.registers[reg] == imm {
 				emulator.pc += 2
 			}
 		case 0x4:
-			reg, imm := reg_and_immediate(ix)
+			reg, imm := reg_imm(ix)
 			if emulator.registers[reg] != imm {
 				emulator.pc += 2
 			}
 		case 0x5:
-			if reg1, reg2 := regs(ix); emulator.registers[reg1] == emulator.registers[reg2] {
+			if reg1, reg2 := reg_reg(ix); emulator.registers[reg1] == emulator.registers[reg2] {
 				emulator.pc += 2
 			}
 		case 0x6:
-			reg := u8((ix >> 8) & 0x0F)
-			imm := u8(ix & 0xFF)
-
+			reg, imm := reg_imm(ix)
 			emulator.registers[reg] = imm
 		case 0x7:
-			reg := u8((ix >> 8) & 0x0F)
-			imm := u8(ix & 0xFF)
-
+			reg, imm := reg_imm(ix)
 			emulator.registers[reg] += imm
 		case 0x8:
-			reg1, reg2 := regs(ix)
+			reg1, reg2 := reg_reg(ix)
 			flag := ix & 0x000F
 
 			registers := &emulator.registers
@@ -173,26 +196,29 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				registers[reg1] <<= 1
 				registers[0xF] = vf
 			case:
-				log.errorf("instruction unimplemented: ", ix)
-				assert(false)
-
+				ix_unimplemented(ix)
 			}
 		case 0x9:
-			if reg1, reg2 := regs(ix); emulator.registers[reg1] != emulator.registers[reg2] {
+			if reg1, reg2 := reg_reg(ix); emulator.registers[reg1] != emulator.registers[reg2] {
 				emulator.pc += 2
 			}
 		case 0xA:
 			emulator.address_register = ix & 0x0FFF
+		case 0xB:
+			emulator.address_register = u16(emulator.registers[0]) + (ix & 0x0FFF)
+		case 0xC:
+			reg, imm := reg_imm(ix)
+			r := u8(rand.uint_range(0, 0xFF))
+			emulator.registers[reg] = r & imm
 		case 0xD:
-			x_reg := u8((ix & 0x0F00) >> 8)
-			y_reg := u8((ix >> 4) & 0x0F)
+			x_reg, y_reg := reg_reg(ix)
 			height := u8(ix) & 0x0F
 
-			x, y := emulator.registers[x_reg], emulator.registers[y_reg]
+			x, y := emulator.registers[x_reg] % 64, emulator.registers[y_reg] % 32
 
 			emulator.registers[0xF] = 0
 
-			for y_offset in 0 ..< u8(height) {
+			rows: for y_offset in 0 ..< u8(height) {
 				mem_idx := emulator.address_register + u16(y_offset)
 				sprite := emulator.memory[mem_idx]
 
@@ -205,6 +231,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 						px := x + x_offset
 						display_idx := int(py) * SCREEN_COLUMNS + int(px)
 
+						if display_idx > SCREEN_COLUMNS * SCREEN_ROWS {
+							break rows
+						}
+
 						if emulator.display[display_idx] == 1 {
 							emulator.registers[0xF] = 1
 						}
@@ -213,8 +243,7 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				}
 			}
 		case 0xE:
-			reg, _ := regs(ix)
-			flag := ix & 0xFF
+			reg, flag := reg_imm(ix)
 
 			switch flag {
 			case 0x9E:
@@ -236,14 +265,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 					emulator.pc += 2
 				}
 			case:
-				log.errorf("instruction unimplemented: ", ix)
-				assert(false)
-
+				ix_unimplemented(ix)
 			}
 		case 0xF:
-			reg, _ := regs(ix)
-			flag := ix & 0xFF
-
+			reg, flag := reg_imm(ix)
 			registers := &emulator.registers
 
 			switch flag {
@@ -270,6 +295,9 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				emulator.sound_timer = registers[reg]
 			case 0x1E:
 				emulator.address_register += u16(registers[reg])
+			case 0x29:
+				char := registers[reg] & 0x0F
+				emulator.address_register = u16(char * 5)
 			case 0x33:
 				hundreds := registers[reg] / 100
 				tens := (registers[reg] / 10) % 10
@@ -292,13 +320,10 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 					registers[r] = emulator.memory[mem_start + u16(r)]
 				}
 			case:
-				log.errorf("instruction unimplemented: ", ix)
-				assert(false)
-
+				ix_unimplemented(ix)
 			}
 		case:
-			log.errorf("instruction unimplemented: ", ix)
-			assert(false)
+			ix_unimplemented(ix)
 		}
 
 		emulator.pc += 2
