@@ -1,33 +1,35 @@
-package main
+package emulator
 
-import "base:runtime"
 import "core:fmt"
-import "core:log"
 import "core:math"
 import "core:math/rand"
 import "core:mem"
-import "core:os"
-import "core:time"
 
-import SDL "vendor:sdl2"
-
-draw_pixel :: proc(renderer: ^SDL.Renderer, x, y: u8) {
-	SDL.SetRenderDrawColor(renderer, 0, 0, 0, 255)
-	SDL.RenderFillRectF(renderer, &SDL.FRect{x = f32(x) * 10, y = f32(y) * 10, w = 10, h = 10})
-}
+SAMPLE_RATE :: 44100 // hz
+TONE_HZ :: 880
+AMPLITUDE :: 6000
 
 SCREEN_COLUMNS :: 64
 SCREEN_ROWS :: 32
 
-INSTRUCTIONS_PER_FRAME :: 10
-MEM_START :: 0x200
+INSTRUCTIONS_PER_FRAME :: 50
+PROGRAM_MEM_START :: 0x200
 
 STACK_DEPTH :: 12
 REGISTERS_COUNT :: 16
 
+Error :: enum {
+	None,
+	PC_Overflow,
+	PC_Underflow,
+	Stack_Overflow,
+	Stack_Underflow,
+	Unknown_Instruction,
+}
+
 Emulator :: struct {
 	pc:                  u16,
-	stack_idx:           int,
+	stack_idx:           u8,
 	stack:               [STACK_DEPTH]u16,
 	memory:              [4 * mem.Kilobyte]byte,
 	registers:           [REGISTERS_COUNT]byte,
@@ -38,12 +40,28 @@ Emulator :: struct {
 	last_key_pressed:    u8,
 	delay_timer:         u8,
 	sound_timer:         u8,
+
+	//
+	sound_phase:         f64,
+	amplitude:           f64,
+	tone_hz:             f64,
+	sample_rate:         f64,
 }
 
-emulator_init :: proc(emulator: ^Emulator, program_data: []byte) {
-	emulator.pc = MEM_START
+init :: proc(
+	emulator: ^Emulator,
+	program_data: []byte,
+	amplitude: f64 = AMPLITUDE,
+	tone_hz: f64 = TONE_HZ,
+	sample_rate: f64 = SAMPLE_RATE,
+) {
+	emulator.pc = PROGRAM_MEM_START
 	emulator.last_key_pressed = 0xFF
-	copy(emulator.memory[MEM_START:], program_data)
+	copy(emulator.memory[PROGRAM_MEM_START:], program_data)
+
+	emulator.amplitude = amplitude
+	emulator.tone_hz = tone_hz
+	emulator.sample_rate = sample_rate
 
 	font := [?][]byte {
 		[]byte{0xF0, 0x90, 0x90, 0x90, 0xF0}, // 0
@@ -69,7 +87,8 @@ emulator_init :: proc(emulator: ^Emulator, program_data: []byte) {
 	}
 }
 
-emulator_frame_start :: proc(emulator: ^Emulator) {
+@(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
+frame_start :: proc(emulator: ^Emulator) {
 	emulator.last_key_pressed = 0xFF
 	if emulator.sound_timer > 0 {
 		emulator.sound_timer -= 1
@@ -79,7 +98,37 @@ emulator_frame_start :: proc(emulator: ^Emulator) {
 	}
 }
 
-emulator_process_instructions :: proc(emulator: ^Emulator) {
+@(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
+record_key_down :: proc(emulator: ^Emulator, key: u8) {
+	emulator.keys[key] = true
+	emulator.last_key_pressed = key
+}
+
+@(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
+record_key_up :: proc(emulator: ^Emulator, key: u8) {
+	emulator.keys[key] = false
+}
+
+fill_audio_buffer :: proc(emulator: ^Emulator, buf: []i16) -> (filled: u16) {
+	if emulator.sound_timer > 0 {
+		filled = u16(len(buf))
+
+		for _, i in buf {
+			buf[i] = i16(math.sin(emulator.sound_phase * 2 * math.PI) * emulator.amplitude)
+			emulator.sound_phase += f64(emulator.tone_hz) / emulator.sample_rate
+			if emulator.sound_phase > 1 {
+				emulator.sound_phase -= 1
+			}
+		}
+	} else {
+		filled = 0
+	}
+
+	return
+}
+
+@(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
+process_instructions :: proc(emulator: ^Emulator) -> Error {
 	reg_imm :: proc(ix: u16) -> (reg, imm: u8) {
 		reg = u8((ix >> 8) & 0x0F)
 		imm = u8(ix & 0xFF)
@@ -92,13 +141,13 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 		return
 	}
 
-	ix_unimplemented :: proc(ix: u16) {
-		log.errorf("instruction unimplemented: %04x", ix)
-		assert(false)
-	}
-
 	instructions: for _ in 0 ..< INSTRUCTIONS_PER_FRAME {
-		assert(emulator.pc < len(emulator.memory))
+		if emulator.pc >= len(emulator.memory) {
+			return .PC_Overflow
+		}
+		if emulator.pc < PROGRAM_MEM_START {
+			return .PC_Underflow
+		}
 
 		ix := (u16(emulator.memory[emulator.pc]) << 8) | u16(emulator.memory[emulator.pc + 1])
 		opcode := ix >> 12
@@ -113,18 +162,22 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				}
 			case 0x00EE:
 				// return
-				assert(emulator.stack_idx > 0)
+				if emulator.stack_idx <= 0 {
+					return .Stack_Underflow
+				}
 
 				emulator.stack_idx -= 1
 				emulator.pc = emulator.stack[emulator.stack_idx]
 			case:
-				ix_unimplemented(ix)
+				return .Unknown_Instruction
 			}
 		case 0x1:
 			emulator.pc = ix & 0x0FFF
 			continue instructions
 		case 0x2:
-			assert(emulator.stack_idx < STACK_DEPTH + 1)
+			if emulator.stack_idx >= STACK_DEPTH {
+				return .Stack_Overflow
+			}
 
 			emulator.stack[emulator.stack_idx] = emulator.pc
 			emulator.stack_idx += 1
@@ -196,7 +249,7 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 				registers[reg1] <<= 1
 				registers[0xF] = vf
 			case:
-				ix_unimplemented(ix)
+				return .Unknown_Instruction
 			}
 		case 0x9:
 			if reg1, reg2 := reg_reg(ix); emulator.registers[reg1] != emulator.registers[reg2] {
@@ -265,7 +318,7 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 					emulator.pc += 2
 				}
 			case:
-				ix_unimplemented(ix)
+				return .Unknown_Instruction
 			}
 		case 0xF:
 			reg, flag := reg_imm(ix)
@@ -280,14 +333,14 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 					if !emulator.keys[key] {
 						emulator.waiting_for_release = false
 					} else {
-						return
+						return .None
 					}
 				} else {
 					if emulator.last_key_pressed != 0xFF {
 						registers[reg] = emulator.last_key_pressed
 						emulator.waiting_for_release = true
 					}
-					return
+					return .None
 				}
 			case 0x15:
 				emulator.delay_timer = registers[reg]
@@ -320,213 +373,14 @@ emulator_process_instructions :: proc(emulator: ^Emulator) {
 					registers[r] = emulator.memory[mem_start + u16(r)]
 				}
 			case:
-				ix_unimplemented(ix)
+				return .Unknown_Instruction
 			}
 		case:
-			ix_unimplemented(ix)
+			return .Unknown_Instruction
 		}
 
 		emulator.pc += 2
 	}
 
-	return
-}
-
-main :: proc() {
-	context.logger = log.create_file_logger(
-		os.stdout,
-		opt = runtime.Logger_Options {
-			.Terminal_Color,
-			.Time,
-			.Date,
-			.Short_File_Path,
-			.Level,
-			.Procedure,
-		},
-	)
-
-	// load program
-
-	if len(os.args) == 1 {
-		log.error("missing source path")
-		return
-	}
-	program_data, err := os.read_entire_file_from_filename_or_err(
-		os.args[1],
-		allocator = context.allocator,
-	)
-	if err != nil {
-		log.errorf("unable to read source file: %s", err)
-		return
-	}
-
-	// init SDL
-
-	if SDL.Init(SDL.INIT_EVERYTHING) < 0 {
-		log.errorf("unable to init SDL: %s", SDL.GetErrorString())
-		return
-	}
-
-	window := SDL.CreateWindow(
-		"Chip-8",
-		SDL.WINDOWPOS_UNDEFINED,
-		SDL.WINDOWPOS_UNDEFINED,
-		SCREEN_COLUMNS * 10,
-		SCREEN_ROWS * 10,
-		{.SHOWN},
-	)
-	if window == nil {
-		log.errorf("unable to create widow: %s", SDL.GetErrorString())
-		return
-	}
-
-	renderer := SDL.CreateRenderer(window, 0, {})
-	if renderer == nil {
-		log.errorf("unable to create renderer: %s", SDL.GetErrorString())
-		return
-	}
-
-	SAMPLE_RATE :: 44100 // hz
-	TONE_HZ :: 880
-	AMPLITUDE :: 6000
-
-	audio_device := SDL.OpenAudioDevice(
-		nil,
-		false,
-		&SDL.AudioSpec{format = SDL.AUDIO_S16, freq = SAMPLE_RATE, channels = 1, samples = 512},
-		nil,
-		{},
-	)
-	if audio_device == 0 {
-		log.errorf("unable to open audio device: %s", SDL.GetErrorString())
-		return
-	}
-	SDL.PauseAudioDevice(audio_device, false)
-
-	audio_update :: proc(device: SDL.AudioDeviceID, timer: u8, allocator: runtime.Allocator) {
-		queued := SDL.GetQueuedAudioSize(device)
-
-		if timer > 0 {
-			// we want 2 frames worth of sound in queue
-			// we are using AUDIO_S16 format so one sample is 2 bytes
-			target_bytes := u32(SAMPLE_RATE / 30 * size_of(i16))
-			if queued < target_bytes {
-				samples_needed := (target_bytes - queued) / size_of(i16)
-				buf := make([]i16, samples_needed, allocator = allocator)
-				@(static) phase: f64
-
-				for _, i in buf {
-					buf[i] = i16(math.sin(phase * 2 * math.PI) * AMPLITUDE)
-					phase += f64(TONE_HZ) / SAMPLE_RATE
-					if phase > 1 {
-						phase -= 1
-					}
-				}
-
-				if SDL.QueueAudio(device, raw_data(buf), samples_needed * size_of(i16)) != 0 {
-					log.errorf("unable to queue audio: %s", SDL.GetErrorString())
-					assert(false)
-				}
-			}
-		} else {
-			if queued > 0 {
-				SDL.ClearQueuedAudio(device)
-			}
-		}
-	}
-
-	// interpret
-
-	TARGET_FPS: f64 : 60
-	TARGET_FRAME_TIME: f64 : 1 / TARGET_FPS
-
-	emulator: Emulator
-	emulator_init(&emulator, program_data)
-
-	for {
-		frame_start := time.tick_now()
-		free_all(context.temp_allocator)
-
-		audio_update(audio_device, emulator.sound_timer, context.temp_allocator)
-		emulator_frame_start(&emulator)
-
-		{
-			get_key :: proc(scancode: SDL.Scancode) -> (key: u8) {
-				key = 0xFF
-				#partial switch scancode {
-				case .NUM1:
-					key = 0x01
-				case .NUM2:
-					key = 0x02
-				case .NUM3:
-					key = 0x03
-				case .NUM4:
-					key = 0x0C
-				case .Q:
-					key = 0x04
-				case .W:
-					key = 0x05
-				case .E:
-					key = 0x06
-				case .R:
-					key = 0x0D
-				case .A:
-					key = 0x07
-				case .S:
-					key = 0x08
-				case .D:
-					key = 0x09
-				case .F:
-					key = 0x0E
-				case .Z:
-					key = 0x0A
-				case .X:
-					key = 0x00
-				case .C:
-					key = 0x0B
-				case .V:
-					key = 0x0F
-				}
-				return
-			}
-
-			event: SDL.Event
-			for SDL.PollEvent(&event) {
-				#partial switch event.type {
-				case .QUIT:
-					return
-				case .KEYDOWN:
-					if key := get_key(event.key.keysym.scancode); key != 0xFF {
-						emulator.keys[key] = true
-						emulator.last_key_pressed = key
-					}
-				case .KEYUP:
-					if key := get_key(event.key.keysym.scancode); key != 0xFF {
-						emulator.keys[key] = false
-					}
-				}
-			}
-		}
-
-		emulator_process_instructions(&emulator)
-
-		// draw
-
-		SDL.SetRenderDrawColor(renderer, 255, 255, 255, 255)
-		SDL.RenderClear(renderer)
-
-		for pixel, pixel_idx in emulator.display do if pixel == 1 {
-			px := u8(pixel_idx % 64)
-			py := u8(pixel_idx / 64)
-			draw_pixel(renderer, px, py)
-		}
-
-		SDL.RenderPresent(renderer)
-
-		frame_duration := time.tick_since(frame_start)
-		remaining := TARGET_FRAME_TIME - time.duration_seconds(frame_duration)
-		if remaining > 0 {
-			time.sleep(time.Duration(remaining * f64(time.Second)))
-		}
-	}
+	return .None
 }
