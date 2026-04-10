@@ -1,6 +1,7 @@
 #+feature using-stmt
 package emulator
 
+import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:math/rand"
@@ -13,7 +14,7 @@ AMPLITUDE :: 6000
 SCREEN_COLUMNS :: 64
 SCREEN_ROWS :: 32
 
-INSTRUCTIONS_PER_FRAME :: 50
+INSTRUCTIONS_PER_FRAME :: 10
 PROGRAM_MEM_START :: 0x200
 
 STACK_DEPTH :: 12
@@ -30,6 +31,7 @@ Error :: enum {
 }
 
 Emulator :: struct {
+	random_generator:    runtime.Random_Generator,
 	pc:                  u16,
 	stack_idx:           u8,
 	stack:               [STACK_DEPTH]u16,
@@ -44,7 +46,9 @@ Emulator :: struct {
 	sound_timer:         u8,
 }
 
-init :: proc(emulator: ^Emulator) {
+init :: proc(emulator: ^Emulator, random_generator: runtime.Random_Generator) {
+	emulator.random_generator = random_generator
+
 	font := [?][]byte {
 		[]byte{0xF0, 0x90, 0x90, 0x90, 0xF0}, // 0
 		[]byte{0x20, 0x60, 0x20, 0x20, 0x70}, // 1
@@ -126,6 +130,8 @@ record_key_up :: proc(emulator: ^Emulator, key: u8) {
 
 @(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
 process_instructions :: proc(emulator: ^Emulator) -> Error {
+	context.random_generator = emulator.random_generator
+
 	reg_imm :: proc(ix: u16) -> (reg, imm: u8) {
 		reg = u8((ix >> 8) & 0x0F)
 		imm = u8(ix & 0xFF)
@@ -146,7 +152,7 @@ process_instructions :: proc(emulator: ^Emulator) -> Error {
 			return .PC_Underflow
 		}
 
-		ix := (u16(emulator.memory[emulator.pc]) << 8) | u16(emulator.memory[emulator.pc + 1])
+        ix := (u16(emulator.memory[emulator.pc]) << 8) | u16(emulator.memory[emulator.pc + 1])
 		opcode := ix >> 12
 
 		switch opcode {
@@ -279,9 +285,12 @@ process_instructions :: proc(emulator: ^Emulator) -> Error {
 
 					if sprite_bit != 0 {
 						px := x + x_offset
+						if px >= SCREEN_COLUMNS {
+							continue rows
+						}
 						display_idx := int(py) * SCREEN_COLUMNS + int(px)
 
-						if display_idx > SCREEN_COLUMNS * SCREEN_ROWS {
+						if display_idx >= SCREEN_COLUMNS * SCREEN_ROWS {
 							break rows
 						}
 

@@ -1,6 +1,7 @@
 #+build wasm32
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 
@@ -18,8 +19,10 @@ Init_Result :: struct {
 
 @(export)
 init :: proc() -> Init_Result {
+	random_generator := runtime.default_random_generator()
+
 	mem.arena_init(&slice_allocator_arena, slice_allocator_data[:])
-	em.init(&emulator)
+	em.init(&emulator, random_generator)
 
 	return Init_Result {
 		emulator_ptr = &emulator,

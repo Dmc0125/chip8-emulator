@@ -126,8 +126,9 @@ main :: proc() {
 	TARGET_FRAME_TIME: f64 : 1 / TARGET_FPS
 
 	emulator: em.Emulator
-	em.init(&emulator)
+	em.init(&emulator, context.random_generator)
 	em.load_program(&emulator, program_data)
+    fmt.println(program_data)
 
 	for {
 		frame_start := time.tick_now()
