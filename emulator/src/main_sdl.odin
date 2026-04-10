@@ -71,10 +71,14 @@ main :: proc() {
 		return
 	}
 
+	SAMPLE_RATE :: 44100 // hz
+	TONE_HZ :: 880
+	AMPLITUDE :: 6000
+
 	audio_device := SDL.OpenAudioDevice(
 		nil,
 		false,
-		&SDL.AudioSpec{format = SDL.AUDIO_S16, freq = em.SAMPLE_RATE, channels = 1, samples = 512},
+		&SDL.AudioSpec{format = SDL.AUDIO_S16, freq = SAMPLE_RATE, channels = 1, samples = 512},
 		nil,
 		{},
 	)
@@ -84,30 +88,34 @@ main :: proc() {
 	}
 	SDL.PauseAudioDevice(audio_device, false)
 
-	audio_update :: proc(
-		device: SDL.AudioDeviceID,
-		emulator: ^em.Emulator,
-		allocator: runtime.Allocator,
-	) {
+	audio_update :: proc(device: SDL.AudioDeviceID, timer: u8, allocator: runtime.Allocator) {
 		queued := SDL.GetQueuedAudioSize(device)
-		// we want 2 frames worth of sound in queue
-		// we are using AUDIO_S16 format so one sample is 2 bytes
-		target_bytes := u32(em.SAMPLE_RATE / 30 * size_of(i16))
 
-		if queued < target_bytes {
-			samples_needed := (target_bytes - queued) / size_of(i16)
-			buf := make([]i16, samples_needed, allocator = allocator)
-			filled := em.fill_audio_buffer(emulator, buf)
+		if timer > 0 {
+			// we want 2 frames worth of sound in queue
+			// we are using AUDIO_S16 format so one sample is 2 bytes
+			target_bytes := u32(SAMPLE_RATE / 30 * size_of(i16))
+			if queued < target_bytes {
+				samples_needed := (target_bytes - queued) / size_of(i16)
+				buf := make([]i16, samples_needed, allocator = allocator)
+				@(static) phase: f64
 
-			if filled > 0 {
+				for _, i in buf {
+					buf[i] = i16(math.sin(phase * 2 * math.PI) * AMPLITUDE)
+					phase += f64(TONE_HZ) / SAMPLE_RATE
+					if phase > 1 {
+						phase -= 1
+					}
+				}
+
 				if SDL.QueueAudio(device, raw_data(buf), samples_needed * size_of(i16)) != 0 {
 					log.errorf("unable to queue audio: %s", SDL.GetErrorString())
 					assert(false)
 				}
-			} else {
-				if queued > 0 {
-					SDL.ClearQueuedAudio(device)
-				}
+			}
+		} else {
+			if queued > 0 {
+				SDL.ClearQueuedAudio(device)
 			}
 		}
 	}
@@ -118,7 +126,8 @@ main :: proc() {
 	TARGET_FRAME_TIME: f64 : 1 / TARGET_FPS
 
 	emulator: em.Emulator
-	em.init(&emulator, program_data)
+	em.init(&emulator)
+	em.load_program(&emulator, program_data)
 
 	for {
 		frame_start := time.tick_now()
@@ -191,7 +200,7 @@ main :: proc() {
 
 		// play audo
 
-		audio_update(audio_device, &emulator, context.temp_allocator)
+		audio_update(audio_device, emulator.sound_timer, context.temp_allocator)
 
 		// draw
 

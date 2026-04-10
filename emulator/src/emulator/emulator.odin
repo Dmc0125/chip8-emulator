@@ -1,3 +1,4 @@
+#+feature using-stmt
 package emulator
 
 import "core:fmt"
@@ -20,6 +21,7 @@ REGISTERS_COUNT :: 16
 
 Error :: enum {
 	None,
+	Program_Data_Overflow,
 	PC_Overflow,
 	PC_Underflow,
 	Stack_Overflow,
@@ -40,29 +42,9 @@ Emulator :: struct {
 	last_key_pressed:    u8,
 	delay_timer:         u8,
 	sound_timer:         u8,
-
-	//
-	sound_phase:         f64,
-	amplitude:           f64,
-	tone_hz:             f64,
-	sample_rate:         f64,
 }
 
-init :: proc(
-	emulator: ^Emulator,
-	program_data: []byte,
-	amplitude: f64 = AMPLITUDE,
-	tone_hz: f64 = TONE_HZ,
-	sample_rate: f64 = SAMPLE_RATE,
-) {
-	emulator.pc = PROGRAM_MEM_START
-	emulator.last_key_pressed = 0xFF
-	copy(emulator.memory[PROGRAM_MEM_START:], program_data)
-
-	emulator.amplitude = amplitude
-	emulator.tone_hz = tone_hz
-	emulator.sample_rate = sample_rate
-
+init :: proc(emulator: ^Emulator) {
 	font := [?][]byte {
 		[]byte{0xF0, 0x90, 0x90, 0x90, 0xF0}, // 0
 		[]byte{0x20, 0x60, 0x20, 0x20, 0x70}, // 1
@@ -87,6 +69,39 @@ init :: proc(
 	}
 }
 
+load_program :: proc(emulator: ^Emulator, program_data: []byte) -> Error {
+	using emulator
+
+	if len(program_data) > len(memory) - PROGRAM_MEM_START {
+		return .Program_Data_Overflow
+	}
+
+	pc = PROGRAM_MEM_START
+	stack_idx = 0
+	address_register = 0
+
+	copy(memory[PROGRAM_MEM_START:], program_data[:])
+
+	for _, i in registers {
+		registers[i] = 0
+	}
+
+	for _, i in display {
+		display[i] = 0
+	}
+
+	waiting_for_release = false
+	last_key_pressed = 0xFF
+	for _, i in keys {
+		keys[i] = false
+	}
+
+	delay_timer = 0
+	sound_timer = 0
+
+	return .None
+}
+
 @(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
 frame_start :: proc(emulator: ^Emulator) {
 	emulator.last_key_pressed = 0xFF
@@ -107,24 +122,6 @@ record_key_down :: proc(emulator: ^Emulator, key: u8) {
 @(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")
 record_key_up :: proc(emulator: ^Emulator, key: u8) {
 	emulator.keys[key] = false
-}
-
-fill_audio_buffer :: proc(emulator: ^Emulator, buf: []i16) -> (filled: u16) {
-	if emulator.sound_timer > 0 {
-		filled = u16(len(buf))
-
-		for _, i in buf {
-			buf[i] = i16(math.sin(emulator.sound_phase * 2 * math.PI) * emulator.amplitude)
-			emulator.sound_phase += f64(emulator.tone_hz) / emulator.sample_rate
-			if emulator.sound_phase > 1 {
-				emulator.sound_phase -= 1
-			}
-		}
-	} else {
-		filled = 0
-	}
-
-	return
 }
 
 @(export = ODIN_ARCH == .wasm32, link_prefix = "emulator_")

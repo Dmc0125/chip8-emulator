@@ -19,6 +19,7 @@ Init_Result :: struct {
 @(export)
 init :: proc() -> Init_Result {
 	mem.arena_init(&slice_allocator_arena, slice_allocator_data[:])
+	em.init(&emulator)
 
 	return Init_Result {
 		emulator_ptr = &emulator,
@@ -35,7 +36,16 @@ alloc_u8_slice :: proc(len: u16) -> rawptr {
 }
 
 @(export)
-emulator_init :: proc(emulator: ^em.Emulator, program_data_ptr: [^]u8, program_data_len: int) {
+emulator_load_program :: proc(
+	emulator: ^em.Emulator,
+	program_data_ptr: [^]u8,
+	program_data_len: int,
+) {
 	program_data := program_data_ptr[:program_data_len]
-	em.init(emulator, program_data)
+	em.load_program(emulator, program_data)
+}
+
+@(export)
+emulator_play_sound :: proc(emulator: ^em.Emulator) -> bool {
+	return emulator.sound_timer > 0
 }
